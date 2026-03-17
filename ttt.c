@@ -9,7 +9,7 @@
 #define NN_INPUT_SIZE 18
 #define NN_HIDDEN_SIZE 100
 #define NN_OUTPUT_SIZE 9
-#define LEARNING_RATE 0.1
+#define LEARNING_RATE 0.01
 
 // Game board representation.
 typedef struct {
@@ -17,22 +17,33 @@ typedef struct {
     int current_player;     // 0 for player (X), 1 for computer (O).
 } GameState;
 
-/* Neural network structure. For simplicity we have just
- * one hidden layer and fixed sizes (see defines above).
- * However for this problem going deeper than one hidden layer
- * is useless. */
+/* Neural network structure with residual connection.
+ * Two hidden layers: input -> hidden1 -> (hidden1 + proj(input)) -> hidden2 -> output.
+ * A projection matrix maps the input to the hidden size so that the residual
+ * addition is dimension-compatible. */
 typedef struct {
-    // Weights and biases.
+    // Weights and biases for first hidden layer (input -> hidden1).
     float weights_ih[NN_INPUT_SIZE * NN_HIDDEN_SIZE];
-    float weights_ho[NN_HIDDEN_SIZE * NN_OUTPUT_SIZE];
     float biases_h[NN_HIDDEN_SIZE];
+
+    // Projection weights for residual connection (input -> hidden size).
+    float weights_proj[NN_INPUT_SIZE * NN_HIDDEN_SIZE];
+
+    // Weights and biases for second hidden layer (residual -> hidden2).
+    float weights_h1h2[NN_HIDDEN_SIZE * NN_HIDDEN_SIZE];
+    float biases_h2[NN_HIDDEN_SIZE];
+
+    // Weights and biases for output layer (hidden2 -> output).
+    float weights_ho[NN_HIDDEN_SIZE * NN_OUTPUT_SIZE];
     float biases_o[NN_OUTPUT_SIZE];
 
     // Activations are part of the structure itself for simplicity.
     float inputs[NN_INPUT_SIZE];
-    float hidden[NN_HIDDEN_SIZE];
-    float raw_logits[NN_OUTPUT_SIZE]; // Outputs before softmax().
-    float outputs[NN_OUTPUT_SIZE];    // Outputs after softmax().
+    float hidden[NN_HIDDEN_SIZE];      // First hidden layer (post-ReLU).
+    float residual[NN_HIDDEN_SIZE];    // hidden1 + proj(input).
+    float hidden2[NN_HIDDEN_SIZE];     // Second hidden layer (post-ReLU).
+    float raw_logits[NN_OUTPUT_SIZE];  // Outputs before softmax().
+    float outputs[NN_OUTPUT_SIZE];     // Outputs after softmax().
 } NeuralNetwork;
 
 /* ReLU activation function */
@@ -54,11 +65,20 @@ void init_neural_network(NeuralNetwork *nn) {
     for (int i = 0; i < NN_INPUT_SIZE * NN_HIDDEN_SIZE; i++)
         nn->weights_ih[i] = RANDOM_WEIGHT();
 
+    for (int i = 0; i < NN_INPUT_SIZE * NN_HIDDEN_SIZE; i++)
+        nn->weights_proj[i] = RANDOM_WEIGHT();
+
+    for (int i = 0; i < NN_HIDDEN_SIZE * NN_HIDDEN_SIZE; i++)
+        nn->weights_h1h2[i] = RANDOM_WEIGHT();
+
     for (int i = 0; i < NN_HIDDEN_SIZE * NN_OUTPUT_SIZE; i++)
         nn->weights_ho[i] = RANDOM_WEIGHT();
 
     for (int i = 0; i < NN_HIDDEN_SIZE; i++)
         nn->biases_h[i] = RANDOM_WEIGHT();
+
+    for (int i = 0; i < NN_HIDDEN_SIZE; i++)
+        nn->biases_h2[i] = RANDOM_WEIGHT();
 
     for (int i = 0; i < NN_OUTPUT_SIZE; i++)
         nn->biases_o[i] = RANDOM_WEIGHT();
@@ -103,7 +123,7 @@ void forward_pass(NeuralNetwork *nn, float *inputs) {
     // Copy inputs.
     memcpy(nn->inputs, inputs, NN_INPUT_SIZE * sizeof(float));
 
-    // Input to hidden layer.
+    // Input to first hidden layer.
     for (int i = 0; i < NN_HIDDEN_SIZE; i++) {
         float sum = nn->biases_h[i];
         for (int j = 0; j < NN_INPUT_SIZE; j++) {
@@ -112,11 +132,29 @@ void forward_pass(NeuralNetwork *nn, float *inputs) {
         nn->hidden[i] = relu(sum);
     }
 
-    // Hidden to output (raw logits).
+    // Residual connection: project input to hidden size and add to hidden1.
+    for (int i = 0; i < NN_HIDDEN_SIZE; i++) {
+        float proj = 0;
+        for (int j = 0; j < NN_INPUT_SIZE; j++) {
+            proj += inputs[j] * nn->weights_proj[j * NN_HIDDEN_SIZE + i];
+        }
+        nn->residual[i] = nn->hidden[i] + proj;
+    }
+
+    // Residual to second hidden layer.
+    for (int i = 0; i < NN_HIDDEN_SIZE; i++) {
+        float sum = nn->biases_h2[i];
+        for (int j = 0; j < NN_HIDDEN_SIZE; j++) {
+            sum += nn->residual[j] * nn->weights_h1h2[j * NN_HIDDEN_SIZE + i];
+        }
+        nn->hidden2[i] = relu(sum);
+    }
+
+    // Second hidden layer to output (raw logits).
     for (int i = 0; i < NN_OUTPUT_SIZE; i++) {
         nn->raw_logits[i] = nn->biases_o[i];
         for (int j = 0; j < NN_HIDDEN_SIZE; j++) {
-            nn->raw_logits[i] += nn->hidden[j] * nn->weights_ho[j * NN_OUTPUT_SIZE + i];
+            nn->raw_logits[i] += nn->hidden2[j] * nn->weights_ho[j * NN_OUTPUT_SIZE + i];
         }
     }
 
@@ -299,7 +337,9 @@ int get_computer_move(GameState *state, NeuralNetwork *nn, int display_probs) {
  * reward we want to provide. */
 void backprop(NeuralNetwork *nn, float *target_probs, float learning_rate, float reward_scaling) {
     float output_deltas[NN_OUTPUT_SIZE];
-    float hidden_deltas[NN_HIDDEN_SIZE];
+    float hidden2_deltas[NN_HIDDEN_SIZE];
+    float residual_deltas[NN_HIDDEN_SIZE];
+    float hidden1_deltas[NN_HIDDEN_SIZE];
 
     /* === STEP 1: Compute deltas === */
 
@@ -323,13 +363,27 @@ void backprop(NeuralNetwork *nn, float *target_probs, float learning_rate, float
             (nn->outputs[i] - target_probs[i]) * fabsf(reward_scaling);
     }
 
-    // Backpropagate error to hidden layer.
+    // Backpropagate error to second hidden layer.
     for (int i = 0; i < NN_HIDDEN_SIZE; i++) {
         float error = 0;
         for (int j = 0; j < NN_OUTPUT_SIZE; j++) {
             error += output_deltas[j] * nn->weights_ho[i * NN_OUTPUT_SIZE + j];
         }
-        hidden_deltas[i] = error * relu_derivative(nn->hidden[i]);
+        hidden2_deltas[i] = error * relu_derivative(nn->hidden2[i]);
+    }
+
+    // Backpropagate error through the residual node to hidden1 and projection.
+    for (int i = 0; i < NN_HIDDEN_SIZE; i++) {
+        float error = 0;
+        for (int j = 0; j < NN_HIDDEN_SIZE; j++) {
+            error += hidden2_deltas[j] * nn->weights_h1h2[i * NN_HIDDEN_SIZE + j];
+        }
+        residual_deltas[i] = error;
+    }
+
+    // Hidden1 deltas: residual gradient flows back through ReLU.
+    for (int i = 0; i < NN_HIDDEN_SIZE; i++) {
+        hidden1_deltas[i] = residual_deltas[i] * relu_derivative(nn->hidden[i]);
     }
 
     /* === STEP 2: Weights updating === */
@@ -338,22 +392,41 @@ void backprop(NeuralNetwork *nn, float *target_probs, float learning_rate, float
     for (int i = 0; i < NN_HIDDEN_SIZE; i++) {
         for (int j = 0; j < NN_OUTPUT_SIZE; j++) {
             nn->weights_ho[i * NN_OUTPUT_SIZE + j] -=
-                learning_rate * output_deltas[j] * nn->hidden[i];
+                learning_rate * output_deltas[j] * nn->hidden2[i];
         }
     }
     for (int j = 0; j < NN_OUTPUT_SIZE; j++) {
         nn->biases_o[j] -= learning_rate * output_deltas[j];
     }
 
-    // Hidden layer weights and biases.
-    for (int i = 0; i < NN_INPUT_SIZE; i++) {
+    // Second hidden layer weights and biases.
+    for (int i = 0; i < NN_HIDDEN_SIZE; i++) {
         for (int j = 0; j < NN_HIDDEN_SIZE; j++) {
-            nn->weights_ih[i * NN_HIDDEN_SIZE + j] -=
-                learning_rate * hidden_deltas[j] * nn->inputs[i];
+            nn->weights_h1h2[i * NN_HIDDEN_SIZE + j] -=
+                learning_rate * hidden2_deltas[j] * nn->residual[i];
         }
     }
     for (int j = 0; j < NN_HIDDEN_SIZE; j++) {
-        nn->biases_h[j] -= learning_rate * hidden_deltas[j];
+        nn->biases_h2[j] -= learning_rate * hidden2_deltas[j];
+    }
+
+    // First hidden layer weights and biases.
+    for (int i = 0; i < NN_INPUT_SIZE; i++) {
+        for (int j = 0; j < NN_HIDDEN_SIZE; j++) {
+            nn->weights_ih[i * NN_HIDDEN_SIZE + j] -=
+                learning_rate * hidden1_deltas[j] * nn->inputs[i];
+        }
+    }
+    for (int j = 0; j < NN_HIDDEN_SIZE; j++) {
+        nn->biases_h[j] -= learning_rate * hidden1_deltas[j];
+    }
+
+    // Projection weights for residual connection.
+    for (int i = 0; i < NN_INPUT_SIZE; i++) {
+        for (int j = 0; j < NN_HIDDEN_SIZE; j++) {
+            nn->weights_proj[i * NN_HIDDEN_SIZE + j] -=
+                learning_rate * residual_deltas[j] * nn->inputs[i];
+        }
     }
 }
 
